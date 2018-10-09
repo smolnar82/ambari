@@ -19,7 +19,9 @@
 package org.apache.ambari.server.orm.dao;
 
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import javax.persistence.EntityManager;
 import javax.persistence.NoResultException;
@@ -28,12 +30,17 @@ import javax.persistence.criteria.CriteriaBuilder;
 import javax.persistence.criteria.CriteriaQuery;
 import javax.persistence.criteria.Root;
 
+import org.apache.ambari.server.AmbariRuntimeException;
 import org.apache.ambari.server.orm.RequiresSession;
 import org.apache.ambari.server.orm.entities.ClusterConfigEntity;
 import org.apache.ambari.server.orm.entities.ClusterEntity;
 import org.apache.ambari.server.orm.entities.StackEntity;
+import org.apache.ambari.server.security.encryption.EncryptionService;
 import org.apache.ambari.server.state.StackId;
+import org.apache.ambari.server.utils.TextEncoding;
 
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import com.google.inject.Inject;
 import com.google.inject.Provider;
 import com.google.inject.Singleton;
@@ -41,6 +48,8 @@ import com.google.inject.persist.Transactional;
 
 @Singleton
 public class ClusterDAO {
+  
+  private final static String ENCRYPTED_PROPERTY_PREFIX = "${enc=aes256_hex, value=";
 
   @Inject
   private Provider<EntityManager> entityManagerProvider;
@@ -50,6 +59,9 @@ public class ClusterDAO {
 
   @Inject
   private StackDAO stackDAO;
+
+  @Inject
+  private EncryptionService encryptionService;
 
   /**
    * Looks for Cluster by ID
@@ -96,8 +108,43 @@ public class ClusterDAO {
 
   @RequiresSession
   public ClusterConfigEntity findConfig(Long configEntityPK) {
-    return entityManagerProvider.get().find(ClusterConfigEntity.class,
-      configEntityPK);
+    final ClusterConfigEntity clusterConfig  = entityManagerProvider.get().find(ClusterConfigEntity.class, configEntityPK);
+    decryptSensitiveData(clusterConfig);
+    return clusterConfig;
+  }
+
+  private void decryptSensitiveData(ClusterConfigEntity entity) {
+    decryptSensitiveData(entity, null);
+  }
+
+  private void decryptSensitiveData(ClusterConfigEntity clusterConfig, Gson gson) {
+    if (gson == null) {
+      gson = new GsonBuilder().disableHtmlEscaping().create();
+    }
+    final Map<String, String> properties = new HashMap<>();
+    String value;
+    for (Map.Entry<String, String> property : ((Map<String, String>) gson.fromJson(clusterConfig.getData(), Map.class)).entrySet()) {
+      value = property.getValue().startsWith(ENCRYPTED_PROPERTY_PREFIX) ? decryptProperty(property.getValue()) : property.getValue();
+      properties.put(property.getKey(), value);
+    }
+    clusterConfig.setData(gson.toJson(properties));
+  }
+
+  private String decryptProperty(String property) {
+    try {
+      // sample value: ${enc=aes256_hex, value=5248...303d}
+      final String encrypted = property.substring(ENCRYPTED_PROPERTY_PREFIX.length(), property.indexOf('}'));
+      return encryptionService.decrypt(encrypted, TextEncoding.BIN_HEX);
+    } catch (Exception e) {
+      throw new AmbariRuntimeException("Error while decrypting property", e);
+    }
+  }
+
+  private void decryptSensitiveData(List<ClusterConfigEntity> clusterConfigs) {
+    final Gson gson = new GsonBuilder().disableHtmlEscaping().create();
+    for (ClusterConfigEntity clusterConfig : clusterConfigs) {
+      decryptSensitiveData(clusterConfig, gson);
+    }
   }
 
   @RequiresSession
@@ -110,8 +157,9 @@ public class ClusterDAO {
         cb.equal(config.get("type"), type),
         cb.equal(config.get("tag"), tag)
     );
-    TypedQuery<ClusterConfigEntity> query = entityManagerProvider.get().createQuery(cq);
-    return daoUtils.selectOne(query);
+    final ClusterConfigEntity clusterConfig = daoUtils.selectOne(entityManagerProvider.get().createQuery(cq));
+    decryptSensitiveData(clusterConfig);
+    return clusterConfig;
   }
 
   @RequiresSession
@@ -123,7 +171,9 @@ public class ClusterDAO {
     query.setParameter("clusterId", clusterId);
     query.setParameter("types", types);
 
-    return daoUtils.selectList(query);
+    final List<ClusterConfigEntity> clusterConfigs = daoUtils.selectList(query);
+    decryptSensitiveData(clusterConfigs);
+    return clusterConfigs;
   }
 
   @RequiresSession
@@ -136,8 +186,10 @@ public class ClusterDAO {
       cb.equal(config.get("type"), type),
       cb.equal(config.get("version"), version)
     );
-    TypedQuery<ClusterConfigEntity> query = entityManagerProvider.get().createQuery(cq);
-    return daoUtils.selectOne(query);
+    
+    final ClusterConfigEntity clusterConfig = daoUtils.selectOne(entityManagerProvider.get().createQuery(cq));
+    decryptSensitiveData(clusterConfig);
+    return clusterConfig;
   }
 
   /**
@@ -185,7 +237,9 @@ public class ClusterDAO {
     query.setParameter("clusterId", clusterId);
     query.setParameter("stack", stackEntity);
 
-    return daoUtils.selectList(query);
+    final List<ClusterConfigEntity> clusterConfigs = daoUtils.selectList(query);
+    decryptSensitiveData(clusterConfigs);
+    return clusterConfigs;
   }
 
   /**
@@ -213,7 +267,9 @@ public class ClusterDAO {
     query.setParameter("clusterId", clusterId);
     query.setParameter("stack", stackEntity);
 
-    return daoUtils.selectList(query);
+    final List<ClusterConfigEntity> clusterConfigs = daoUtils.selectList(query);
+    decryptSensitiveData(clusterConfigs);
+    return clusterConfigs;
   }
 
   /**
@@ -223,12 +279,14 @@ public class ClusterDAO {
   @RequiresSession
   public List<ClusterConfigEntity> getLatestConfigurationsWithTypes(long clusterId, StackId stackId, Collection<String> configTypes) {
     StackEntity stackEntity = stackDAO.find(stackId.getStackName(), stackId.getStackVersion());
-    return daoUtils.selectList(
-      entityManagerProvider.get()
-      .createNamedQuery("ClusterConfigEntity.findLatestConfigsByStackWithTypes", ClusterConfigEntity.class)
-      .setParameter("clusterId", clusterId)
-      .setParameter("stack", stackEntity)
-      .setParameter("types", configTypes));
+    final TypedQuery<ClusterConfigEntity> query = entityManagerProvider.get()
+        .createNamedQuery("ClusterConfigEntity.findLatestConfigsByStackWithTypes", ClusterConfigEntity.class)
+        .setParameter("clusterId", clusterId)
+        .setParameter("stack", stackEntity)
+        .setParameter("types", configTypes);
+    final List<ClusterConfigEntity> clusterConfigs = daoUtils.selectList(query);
+    decryptSensitiveData(clusterConfigs);
+    return clusterConfigs;
   }
 
   /**
@@ -251,7 +309,9 @@ public class ClusterDAO {
     query.setParameter("clusterId", clusterId);
     query.setParameter("stack", stackEntity);
 
-    return daoUtils.selectList(query);
+    final List<ClusterConfigEntity> clusterConfigs = daoUtils.selectList(query);
+    decryptSensitiveData(clusterConfigs);
+    return clusterConfigs;
   }
 
   /**
@@ -269,7 +329,9 @@ public class ClusterDAO {
 
     query.setParameter("clusterId", clusterId);
 
-    return daoUtils.selectList(query);
+    final List<ClusterConfigEntity> clusterConfigs = daoUtils.selectList(query);
+    decryptSensitiveData(clusterConfigs);
+    return clusterConfigs;
   }
 
   /**

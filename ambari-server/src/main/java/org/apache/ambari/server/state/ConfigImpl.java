@@ -28,6 +28,8 @@ import java.util.concurrent.locks.ReadWriteLock;
 
 import javax.annotation.Nullable;
 
+import org.apache.ambari.server.AmbariRuntimeException;
+import org.apache.ambari.server.configuration.Configuration;
 import org.apache.ambari.server.events.ClusterConfigChangedEvent;
 import org.apache.ambari.server.events.publishers.AmbariEventPublisher;
 import org.apache.ambari.server.logging.LockFactory;
@@ -37,11 +39,15 @@ import org.apache.ambari.server.orm.dao.StackDAO;
 import org.apache.ambari.server.orm.entities.ClusterConfigEntity;
 import org.apache.ambari.server.orm.entities.ClusterEntity;
 import org.apache.ambari.server.orm.entities.StackEntity;
+import org.apache.ambari.server.security.encryption.EncryptionService;
+import org.apache.ambari.server.state.PropertyInfo.PropertyType;
+import org.apache.ambari.server.utils.TextEncoding;
 import org.apache.commons.lang.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import com.google.gson.JsonSyntaxException;
 import com.google.inject.Inject;
 import com.google.inject.assistedinject.Assisted;
@@ -58,6 +64,8 @@ public class ConfigImpl implements Config {
    * A label for {@link #propertyLock} to use with the {@link LockFactory}.
    */
   private static final String PROPERTY_LOCK_LABEL = "configurationPropertyLock";
+
+  private static final String ENCRYPTED_PROPERTY_SCHEME = "${enc=aes256_hex, value=%s}";
 
   public static final String GENERATED_TAG_PREFIX = "generatedTag_";
 
@@ -96,6 +104,10 @@ public class ConfigImpl implements Config {
   @Inject
   private ServiceConfigDAO serviceConfigDAO;
 
+  private EncryptionService encryptionService;
+
+  private Configuration serverConfiguration;
+
   private final AmbariEventPublisher eventPublisher;
 
   @AssistedInject
@@ -104,9 +116,10 @@ public class ConfigImpl implements Config {
       @Assisted Map<String, String> properties,
       @Assisted @Nullable Map<String, Map<String, String>> propertiesAttributes,
       ClusterDAO clusterDAO, StackDAO stackDAO,
-      Gson gson, AmbariEventPublisher eventPublisher, LockFactory lockFactory) {
+      Gson gson, AmbariEventPublisher eventPublisher, LockFactory lockFactory,
+      EncryptionService encryptionService, Configuration serverConfiguration) {
     this(cluster.getDesiredStackVersion(), cluster, type, tag, properties, propertiesAttributes,
-        clusterDAO, stackDAO, gson, eventPublisher, lockFactory);
+        clusterDAO, stackDAO, gson, eventPublisher, lockFactory, encryptionService, serverConfiguration);
   }
 
 
@@ -116,7 +129,8 @@ public class ConfigImpl implements Config {
       @Assisted Map<String, String> properties,
       @Assisted @Nullable Map<String, Map<String, String>> propertiesAttributes,
       ClusterDAO clusterDAO, StackDAO stackDAO,
-      Gson gson, AmbariEventPublisher eventPublisher, LockFactory lockFactory) {
+      Gson gson, AmbariEventPublisher eventPublisher, LockFactory lockFactory,
+      EncryptionService encryptionService, Configuration serverConfiguration) {
 
     propertyLock = lockFactory.newReadWriteLock(PROPERTY_LOCK_LABEL);
 
@@ -131,6 +145,8 @@ public class ConfigImpl implements Config {
     this.clusterDAO = clusterDAO;
     this.gson = gson;
     this.eventPublisher = eventPublisher;
+    this.encryptionService = encryptionService;
+    this.serverConfiguration = serverConfiguration;
     version = cluster.getNextConfigVersion(type);
 
     // tag is nullable from factory but not in the DB, so ensure we generate something
@@ -344,6 +360,10 @@ public class ConfigImpl implements Config {
    * transaction has been committed.
    */
   private void persist(ClusterConfigEntity entity) {
+    if (serverConfiguration.shouldEncryptSensitiveData()) {
+      encryptSensitiveData(entity);
+    }
+
     persistEntitiesInTransaction(entity);
 
     // ensure that the in-memory state of the cluster is kept consistent
@@ -357,6 +377,27 @@ public class ConfigImpl implements Config {
         getType(), getTag(), getVersion());
 
     eventPublisher.publish(event);
+  }
+
+  private void encryptSensitiveData(ClusterConfigEntity entity) {
+    final Gson gson = new GsonBuilder().disableHtmlEscaping().create();
+    final Set<String> passwordProperties = propertiesTypes.get(PropertyType.PASSWORD);
+    final Map<String, String> properties = new HashMap<>();
+    String value;
+    for (Map.Entry<String, String> property : ((Map<String, String>) gson.fromJson(entity.getData(), Map.class)).entrySet()) {
+      value = passwordProperties.contains(property.getKey()) ? encryptAndDecoratePropertyValue(property.getValue()) : property.getValue();
+      properties.put(property.getKey(), value);
+    }
+    entity.setData(gson.toJson(properties));
+  }
+
+  private String encryptAndDecoratePropertyValue(String propertyValue) {
+    try {
+      final String encrypted = encryptionService.encrypt(propertyValue, TextEncoding.BIN_HEX);
+      return String.format(ENCRYPTED_PROPERTY_SCHEME, encrypted);
+    } catch (Exception e) {
+      throw new AmbariRuntimeException("Error while encrypting property", e);
+    }
   }
 
   /**
